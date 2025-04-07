@@ -151,6 +151,26 @@ class MSDeformableAttention(nn.Module):
             num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
             offset = sampling_offsets * num_points_scale * reference_points[:, :, None, :, 2:] * self.offset_scale
             sampling_locations = reference_points[:, :, None, :, :2] + offset
+            ''' TODO
+            elif reference_points.shape[-1] == 8:
+
+            # 将四边形顶点转换为中心点 + 偏移量
+                # 1. 计算中心点坐标 (x_center, y_center)
+                x_center = reference_points[..., 0::2].mean(dim=-1, keepdim=True)
+                y_center = reference_points[..., 1::2].mean(dim=-1, keepdim=True)
+                centers = torch.cat([x_center, y_center], dim=-1)  # [bs, Len_q, num_levels, 2]
+
+                # 2. 计算偏移量 (相对于中心点)
+                vertices = reference_points.reshape(bs, Len_q, 1, 4, 2)  # [bs, Len_q, L, 4, 2]
+                offsets_from_center = vertices - centers.unsqueeze(-2)  # [bs, Len_q, 1, 4, 2]
+
+                # 3. 应用动态偏移量缩放
+                num_points_scale = self.num_points_scale.to(query.dtype).unsqueeze(-1)
+                offset = sampling_offsets * num_points_scale * offsets_from_center * self.offset_scale
+
+                # 4. 计算最终采样位置
+                sampling_locations = centers + offset'
+            '''
         else:
             raise ValueError(
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".
@@ -247,7 +267,11 @@ class TransformerDecoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
-
+        # 输入特征=4，输出特征=8
+        self.ref2poly_linear = nn.Linear(in_features=4, out_features=8)  
+        # 可选：自定义权重初始化
+        nn.init.xavier_uniform_(self.ref2poly_linear.weight)
+        nn.init.zeros_(self.ref2poly_linear.bias)
     def forward(self,
                 target,
                 ref_points_unact,
@@ -255,38 +279,49 @@ class TransformerDecoder(nn.Module):
                 memory_spatial_shapes,
                 bbox_head,
                 score_head,
+                polygon_head,
                 query_pos_head,
                 attn_mask=None,
                 memory_mask=None):
         dec_out_bboxes = []
         dec_out_logits = []
-        ref_points_detach = F.sigmoid(ref_points_unact)
+        dec_out_polygon = []
 
+        ref_points_detach_8 = F.sigmoid(self.ref2poly_linear(ref_points_unact))
+        ref_points_detach = F.sigmoid(ref_points_unact)
         output = target
         for i, layer in enumerate(self.layers):
             ref_points_input = ref_points_detach.unsqueeze(2)
+            
             query_pos_embed = query_pos_head(ref_points_detach)
 
             output = layer(output, ref_points_input, memory, memory_spatial_shapes, attn_mask, memory_mask, query_pos_embed)
 
-            inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
-
+            
+            inter_ref_polygon= F.sigmoid(polygon_head[i](output) + inverse_sigmoid(ref_points_detach_8))
+            inter_ref_bbox= F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
             if self.training:
                 dec_out_logits.append(score_head[i](output))
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
+                    dec_out_polygon.append(inter_ref_polygon)
                 else:
-                    dec_out_bboxes.append(F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points)))
+                    dec_out_polygon.append(polygon_head[i](output) + inverse_sigmoid(ref_points_poly))
+                    dec_out_bboxes.append(bbox_head[i](output) + inverse_sigmoid(ref_points))
 
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
+                dec_out_polygon.append(inter_ref_polygon)
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
             ref_points = inter_ref_bbox
-            ref_points_detach = inter_ref_bbox.detach()
+            ref_points_detach=inter_ref_bbox.detach()
+            ref_points_poly=inter_ref_polygon
+            ref_points_detach_8 = inter_ref_polygon.detach()
 
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits)
+
+        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits) , torch.stack(dec_out_polygon)
 
 
 @register()
@@ -385,13 +420,20 @@ class RTDETRTransformerv2(nn.Module):
             self.enc_score_head = nn.Linear(hidden_dim, num_classes)
 
         self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
-
+        self.enc_poly_head = MLP(hidden_dim, hidden_dim, 8, 3, act=mlp_act)
         # decoder head
         self.dec_score_head = nn.ModuleList([
             nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)
         ])
+        # 调整回归头输出维度：
         self.dec_bbox_head = nn.ModuleList([
-            MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act) for _ in range(num_layers)
+            MLP(hidden_dim, hidden_dim, 4, 3)  # 输出4维：1(BBox)，
+            for _ in range(num_layers)
+        ])
+                # 调整回归头输出维度：
+        self.dec_polygon_head = nn.ModuleList([
+            MLP(hidden_dim, hidden_dim, 8, 3)  # 输出8维：8(顶点相对坐标)暂时使用参考点来代替
+            for _ in range(num_layers)
         ])
 
         # init encoder output anchors and valid_mask
@@ -401,6 +443,12 @@ class RTDETRTransformerv2(nn.Module):
             self.register_buffer('valid_mask', valid_mask)
 
         self._reset_parameters()
+        # # 输入特征=4，输出特征=8
+        # self.bbox2poly_linear = nn.Linear(in_features=4, out_features=8)  
+        # # 可选：自定义权重初始化
+        # nn.init.xavier_uniform_(self.bbox2poly_linear.weight)
+        # nn.init.zeros_(self.bbox2poly_linear.bias)
+
         
     def _reset_parameters(self):
         bias = bias_init_with_prob(0.01)
@@ -514,16 +562,19 @@ class RTDETRTransformerv2(nn.Module):
         output_memory :torch.Tensor = self.enc_output(memory)
         enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory)
         enc_outputs_coord_unact :torch.Tensor = self.enc_bbox_head(output_memory) + anchors
+        anchors_8=anchors.tile(2)
+        enc_outputs_polygons_unact:torch.Tensor=self.enc_poly_head(output_memory) + anchors_8
 
-        enc_topk_bboxes_list, enc_topk_logits_list = [], []
-        enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact = \
-            self._select_topk(output_memory, enc_outputs_logits, enc_outputs_coord_unact, self.num_queries)
+
+        enc_topk_bboxes_list, enc_topk_logits_list,enc_topk_polygons_list  = [], [],[]
+        enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact ,enc_topk_polygons= \
+            self._select_topk(output_memory, enc_outputs_logits, enc_outputs_coord_unact, enc_outputs_polygons_unact, self.num_queries)
             
         if self.training:
             enc_topk_bboxes = F.sigmoid(enc_topk_bbox_unact)
             enc_topk_bboxes_list.append(enc_topk_bboxes)
             enc_topk_logits_list.append(enc_topk_logits)
-
+            enc_topk_polygons_list.append(enc_topk_polygons)
         # if self.num_select_queries != self.num_queries:            
         #     raise NotImplementedError('')
 
@@ -538,9 +589,9 @@ class RTDETRTransformerv2(nn.Module):
             enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
             content = torch.concat([denoising_logits, content], dim=1)
         
-        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
+        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list,enc_topk_polygons_list
 
-    def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor, outputs_coords_unact: torch.Tensor, topk: int):
+    def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor, outputs_coords_unact: torch.Tensor, outputs_polygons_unact: torch.Tensor,topk: int):
         if self.query_select_method == 'default':
             _, topk_ind = torch.topk(outputs_logits.max(-1).values, topk, dim=-1)
 
@@ -556,13 +607,17 @@ class RTDETRTransformerv2(nn.Module):
         topk_coords = outputs_coords_unact.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_coords_unact.shape[-1]))
         
+        topk_polys=outputs_polygons_unact.gather(dim=1, \
+            index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_polygons_unact.shape[-1]))
+        
         topk_logits = outputs_logits.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_logits.shape[-1]))
         
         topk_memory = memory.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, memory.shape[-1]))
 
-        return topk_memory, topk_logits, topk_coords
+        
+        return topk_memory, topk_logits, topk_coords ,topk_polys
 
 
     def forward(self, feats, targets=None):
@@ -582,42 +637,104 @@ class RTDETRTransformerv2(nn.Module):
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
+        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list,enc_topk_polygons_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits = self.decoder(
+        out_bboxes, out_logits, out_polygons = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
             spatial_shapes,
             self.dec_bbox_head,
             self.dec_score_head,
+            self.dec_polygon_head,
             self.query_pos_head,
             attn_mask=attn_mask)
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
+            dn_out_polygons, out_polygons = torch.split(out_polygons, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
 
-        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
-
+        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_polygons': out_polygons[-1]}
+        
+        # TODO add polygons
         if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
-            out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
+            out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1],out_polygons[:-1])
+            out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list, enc_topk_polygons_list)
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
             if dn_meta is not None:
-                out['dn_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
+                out['dn_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes,dn_out_polygons)
                 out['dn_meta'] = dn_meta
 
         return out
 
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
-                for a, b in zip(outputs_class, outputs_coord)]
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_poly=None):
+        """
+        扩展辅助输出以支持多边形
+        参数:
+            outputs_class: List[Tensor] 各层分类分数
+            outputs_coord: List[Tensor] 各层边界框
+            outputs_poly: Optional[List[Tensor]] 各层多边形坐标
+        返回:
+            List[Dict]: 包含所有预测结果的字典列表
+        """
+        if outputs_poly is not None:
+            # 三输出模式（分类+边界框+多边形）
+            return [
+                {'pred_logits': a, 'pred_boxes': b, 'pred_polygons': c}
+                for a, b, c in zip(outputs_class, outputs_coord, outputs_poly)
+            ]
+        else:
+            # 保持原逻辑兼容性
+            return [{'pred_logits': a, 'pred_boxes': b} 
+                    for a, b in zip(outputs_class, outputs_coord)]
+        
+        # 将真实顶点坐标转换为相对于BBox的归一化偏移量（0~1范围）限制顶点在bbox内
+    def convert_poly_to_relative(poly, bbox):
+        """
+        poly: [x1,y1,x2,y2,x3,y3,x4,y4]
+        bbox: [cx, cy, w, h]
+        """
+        xmin = bbox[0] - bbox[2]/2
+        ymin = bbox[1] - bbox[3]/2
+        rel_poly = [
+            (poly[0]-xmin)/bbox[2], (poly[1]-ymin)/bbox[2],
+            (poly[2]-xmin)/bbox[2], (poly[3]-ymin)/bbox[2],
+            (poly[4]-xmin)/bbox[2], (poly[5]-ymin)/bbox[2],
+            (poly[6]-xmin)/bbox[2], (poly[7]-ymin)/bbox[2]
+        ]
+        return rel_poly  # [0~1, 0~1, ...]
+
+def compute_bbox_from_polygon(
+    polygon_output: torch.Tensor  # 输入形状: (B, N, 8), 8维表示4个顶点坐标 (x1,y1,x2,y2,...,x4,y4)
+) -> torch.Tensor:
+    """
+    根据多边形顶点坐标计算外接矩形 (BBox)。
+    
+    参数:
+        polygon_output: 输入张量，形状为 (B, N, 8)，表示 B 个样本，每个样本 N 个多边形，每个多边形 4 个顶点坐标 (x1,y1,x2,y2,...,x4,y4)
+    
+    返回:
+        bbox: 形状 (B, N, 4)，表示每个多边形的外接矩形 [x_min, y_min, x_max, y_max]
+    """
+    # 1. 将 8 维数据 reshape 成 (B, N, 4, 2)，方便计算
+    points = polygon_output.view(*polygon_output.shape[:-1], 4, 2)  # (B, N, 4, 2)
+    
+    # 2. 计算所有顶点的最小/最大坐标
+    x_coords = points[..., 0]  # (B, N, 4)
+    y_coords = points[..., 1]  # (B, N, 4)
+    
+    x_min = x_coords.min(dim=-1).values  # (B, N)
+    y_min = y_coords.min(dim=-1).values  # (B, N)
+    x_max = x_coords.max(dim=-1).values  # (B, N)
+    y_max = y_coords.max(dim=-1).values  # (B, N)
+    
+    # 3. 拼接成 BBox 格式 [x_min, y_min, x_max, y_max]
+    bbox = torch.stack([x_min, y_min, x_max, y_max], dim=-1)  # (B, N, 4)
+    
+    return bbox

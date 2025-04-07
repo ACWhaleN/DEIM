@@ -41,6 +41,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device)
+        # targets=inspect_targets(targets=targets,device="cuda:0" if torch.cuda.is_available() else "cpu",verbose=True)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
@@ -175,3 +176,84 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
 
     return stats, coco_evaluator
+
+
+def inspect_targets(targets, device=None, verbose=True):
+    """
+    检查targets数据结构并打印详细信息
+    
+    参数:
+        targets: 待检查的目标数据列表
+        device: 目标设备(可选)，如果提供会显示迁移前后的设备信息
+        verbose: 是否打印详细信息(默认True)
+    
+    返回:
+        dict: 包含统计信息的字典
+    """
+    stats = {
+        'num_targets': len(targets),
+        'keys': set(),
+        'tensor_shapes': {},
+        'dtypes': set(),
+        'devices': set()
+    }
+    
+    def _print(*args, **kwargs):
+        if verbose:
+            print(*args, **kwargs)
+    
+    # 打印原始targets信息
+    _print("\n" + "="*40)
+    _print("=== 开始检查targets数据结构 ===")
+    _print(f"共 {len(targets)} 个target")
+    
+    for i, target in enumerate(targets):
+        _print(f"\n--- target {i} ---")
+        for k, v in target.items():
+            stats['keys'].add(k)
+            
+            if isinstance(v, torch.Tensor):
+                stats['tensor_shapes'].setdefault(k, []).append(v.shape)
+                stats['dtypes'].add(str(v.dtype))
+                stats['devices'].add(str(v.device))
+                
+                _print(f"{k}: tensor(shape={v.shape}, dtype={v.dtype}, device={v.device})")
+                if v.numel() <= 10:  # 小张量打印具体值
+                    _print(f"    values: {v.detach().cpu().numpy()}")
+            else:
+                _print(f"{k}: {type(v)}")
+                _print(f"    value: {v}")
+    
+    # 如果有指定设备，执行转换并检查
+    if device is not None:
+        _print("\n" + "="*40)
+        _print(f"=== 执行设备转换到 {device} ===")
+        
+        converted_targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        
+        _print("\n转换后检查:")
+        for i, target in enumerate(converted_targets):
+            _print(f"\n--- target {i} ---")
+            for k, v in target.items():
+                if isinstance(v, torch.Tensor):
+                    _print(f"{k}: device={v.device}")
+                    # 验证设备是否正确
+                    if v.device != torch.device(device):
+                        _print(f"    !!! 设备转换失败，当前设备 {v.device} != 目标设备 {device}")
+                else:
+                    _print(f"{k}: 非tensor数据(未转换)")
+        
+        stats['converted_devices'] = str(device)
+    
+    # 打印统计信息
+    _print("\n" + "="*40)
+    _print("=== 统计信息 ===")
+    _print(f"共有字段: {stats['keys']}")
+    _print(f"张量dtypes: {stats['dtypes']}")
+    _print(f"原始devices: {stats['devices']}")
+    if device is not None:
+        _print(f"目标device: {device}")
+    
+    return stats
+
+

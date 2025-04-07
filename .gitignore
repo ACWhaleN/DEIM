@@ -136,3 +136,8 @@ dmypy.json
 *.zip
 *.html
 .DS_Store
+
+torch_results*
+output/
+data
+.vscode

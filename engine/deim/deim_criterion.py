@@ -214,6 +214,16 @@ class DEIMCriterion(nn.Module):
 
         return losses
 
+    def loss_poly(self, outputs, targets, indices, num_boxes):
+        idx = self._get_src_permutation_idx(indices)
+        src_polys = outputs['pred_polygons'][idx]  # 形状 (num_matched, 8)
+        tgt_polys = torch.cat([t['polys'][i] for t, (_,i) in zip(targets, indices)], 0)  # 形状 (num_matched, 8)
+        
+        # L1 损失，并归一化
+        loss_poly = F.l1_loss(src_polys, tgt_polys, reduction='sum')  # 使用 sum 后归一化
+        loss_poly = loss_poly / num_boxes  # 与其他损失对齐
+        return {'loss_poly': loss_poly}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -260,6 +270,8 @@ class DEIMCriterion(nn.Module):
             'mal': self.loss_labels_mal,
             'local': self.loss_local,
         }
+        if 'pred_polygons' in outputs:
+            loss_map['poly']=self.loss_poly
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 

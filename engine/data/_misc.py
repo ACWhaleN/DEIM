@@ -4,7 +4,9 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
 import importlib.metadata
+import torch
 from torch import Tensor
+from torchvision.tv_tensors import TVTensor
 
 if '0.15.2' in importlib.metadata.version('torchvision'):
     import torchvision
@@ -34,23 +36,74 @@ elif importlib.metadata.version('torchvision') >= '0.17':
 else:
     raise RuntimeError('Please make sure torchvision version >= 0.15.2')
 
+from torchvision.tv_tensors import TVTensor
+import torch
+
+class Polygons(TVTensor):
+    def __new__(
+        cls,
+        data,
+        *,
+        format: str,
+        spatial_size: tuple = None,
+        **kwargs,
+    ):
+        # 1. 先调用 TVTensor._to_tensor 或直接构造 Tensor
+        tensor = cls._to_tensor(data,**kwargs)
+        
+        # 2. 转换为 Polygons 类型
+        tensor = tensor.as_subclass(cls)
+        
+        # 3. 设置额外属性
+        tensor.format = format
+        tensor.spatial_size = spatial_size
+        
+        return tensor
+
+    # 可选：覆盖 __init__ 进行额外初始化
+    def __init__(
+        self,
+        data,
+        *,
+        format: str,
+        spatial_size: tuple = None,
+        **kwargs,
+    ):
+        # 如果已经在 __new__ 中设置了属性，这里可以省略
+        pass
 
 
-def convert_to_tv_tensor(tensor: Tensor, key: str, box_format='xyxy', spatial_size=None) -> Tensor:
+
+
+def convert_to_tv_tensor(
+    tensor: torch.Tensor, 
+    key: str, 
+    box_format: str = 'xyxy', 
+    poly_format: str = 'xy',
+    spatial_size: tuple = None
+) -> TVTensor:
     """
     Args:
-        tensor (Tensor): input tensor
-        key (str): transform to key
-
-    Return:
-        Dict[str, TV_Tensor]
+        tensor: 输入张量
+        key: 数据类型 ('boxes', 'masks', 'polys')
+        box_format: 边界框格式 (仅当 key='boxes' 时有效)
+        poly_format: 多边形格式 (仅当 key='polys' 时有效)
+        spatial_size: 图像尺寸 (h, w)
     """
-    assert key in ('boxes', 'masks', ), "Only support 'boxes' and 'masks'"
+    assert key in ('boxes', 'masks', 'polys'), f"Invalid key: {key}"
 
     if key == 'boxes':
-        box_format = getattr(BoundingBoxFormat, box_format.upper())
-        _kwargs = dict(zip(_boxes_keys, [box_format, spatial_size]))
-        return BoundingBoxes(tensor, **_kwargs)
-
-    if key == 'masks':
-       return Mask(tensor)
+        return BoundingBoxes(
+            tensor, 
+            format=BoundingBoxFormat(box_format.upper()), 
+            canvas_size=spatial_size
+        )
+    elif key == 'masks':
+        return Mask(tensor)
+    elif key == 'polys':
+        # 必须传递为关键字参数
+        return Polygons(
+            tensor, 
+            format=poly_format, 
+            spatial_size=spatial_size
+        )

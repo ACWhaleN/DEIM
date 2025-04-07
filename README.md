@@ -376,6 +376,8 @@ Inference on images and videos is now supported.
 python tools/inference/onnx_inf.py --onnx model.onnx --input image.jpg  # video.mp4
 python tools/inference/trt_inf.py --trt model.engine --input image.jpg
 python tools/inference/torch_inf.py -c configs/deim_dfine/deim_hgnetv2_${model}_coco.yml -r model.pth --input image.jpg --device cuda:0
+
+python tools/inference/torch_inf.py -c configs/deim_rtdetrv2/deim_r18vd_200e_coco.yml -r output/deim_rtdetrv2_r18vd_200e_coco/best_stg1.pth --input data/images/test/116.jpg --device cuda:0
 ```
 </details>
 

@@ -41,7 +41,7 @@ class HungarianMatcher(nn.Module):
         self.cost_class = weight_dict['cost_class']
         self.cost_bbox = weight_dict['cost_bbox']
         self.cost_giou = weight_dict['cost_giou']
-
+        self.cost_poly = weight_dict['cost_poly']
         self.use_focal_loss = use_focal_loss
         self.alpha = alpha
         self.gamma = gamma
@@ -94,15 +94,37 @@ class HungarianMatcher(nn.Module):
         else:
             cost_class = -out_prob[:, tgt_ids]
 
+
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
 
-        # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
-        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
-        C = C.view(bs, num_queries, -1).cpu()
+
+        # 计算基础匹配成本（分类+边界框+GIoU）
+        base_cost = (
+            self.cost_bbox * cost_bbox 
+            + self.cost_class * cost_class 
+            + self.cost_giou * cost_giou
+        )
+
+        # 条件判断：仅当存在pred_polygons时计算多边形成本
+        if 'pred_polygons' in outputs:
+            # 提取预测多边形并展平 [batch*query_num, point_num*2]
+            out_poly = outputs['pred_polygons'].flatten(0, 1)
+            
+            # 提取真实多边形并拼接 [total_gt_num, point_num*2]
+            tgt_poly = torch.cat([v["polys"] for v in targets])
+            
+            # 计算顶点L1距离矩阵 [batch*query_num, total_gt_num]
+            cost_poly = torch.cdist(out_poly, tgt_poly, p=1)
+            
+            # 加权后加入总成本
+            base_cost += self.cost_poly * cost_poly
+
+        # 最终成本矩阵 [batch_size, num_queries, total_gt_num]
+        C = base_cost.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]
         # FIXME，RT-DETR, different way to set NaN

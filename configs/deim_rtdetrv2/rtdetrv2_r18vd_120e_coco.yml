@@ -1,5 +1,5 @@
 __include__: [
-  '../dataset/coco_detection.yml',
+  '../dataset/rm_detection_coco.yml',
   '../runtime.yml',
   '../base/dataloader.yml',
   '../base/rt_optimizer.yml',
@@ -35,10 +35,3 @@ optimizer:
       weight_decay: 0.
 
 
-train_dataloader: 
-  dataset: 
-    transforms:
-      policy:
-        epoch: 117
-  collate_fn:
-    scales: ~

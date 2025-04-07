@@ -39,9 +39,34 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
         self.remap_mscoco_category = remap_mscoco_category
 
     def __getitem__(self, idx):
+        img_info = self.coco.loadImgs(self.ids[idx])[0]
+        assert 'width' in img_info and 'height' in img_info, \
+            f"Image {img_info['id']} missing size info"
+        assert img_info['width'] > 0 and img_info['height'] > 0, \
+            f"Invalid size for image {img_info['id']}"
         img, target = self.load_item(idx)
-        if self._transforms is not None:
+        try:
             img, target, _ = self._transforms(img, target, self)
+            # 确保img是Tensor类型
+            while isinstance(img, tuple):
+                img = img[0]  # 提取第一个元素
+            
+            # 检查boxes和polys的维度一致性
+            if 'boxes' in target and 'polys' in target:
+                boxes_dim0 = target['boxes'].shape[0]
+                polys_dim0 = target['polys'].shape[0]
+                if boxes_dim0 != polys_dim0:
+                    print('debug')
+                    raise ValueError(
+                        f"样本 {self.ids[idx]} 的boxes和polys维度不匹配: "
+                        f"boxes维度0={boxes_dim0}, polys维度0={polys_dim0}"
+                    )
+            
+        except NotImplementedError:
+            print("Current Transforms Chain:")
+            for t in self._transforms.transforms:
+                print(f" - {t.__class__.__name__}")
+            raise
         return img, target
 
     def load_item(self, idx):
@@ -61,6 +86,9 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
 
         if 'masks' in target:
             target['masks'] = convert_to_tv_tensor(target['masks'], key='masks')
+        
+        if 'polys' in target:
+            target['polys'] = convert_to_tv_tensor(target['polys'], key='polys',spatial_size=image.size[::-1])
 
         return image, target
 
@@ -122,11 +150,55 @@ class ConvertCocoPolysToMask(object):
         anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
 
         boxes = [obj["bbox"] for obj in anno]
+
+
         # guard against no boxes via resizing
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
         boxes[:, 2:] += boxes[:, :2]
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
+        
+        # ==================================================================
+        # 多边形处理（新增）
+        # ==================================================================
+        def flatten_segmentation(seg):
+            """处理多层嵌套结构，例如 [[[x1,y1,...]]] -> [x1,y1,...]"""
+            while isinstance(seg, (list, tuple)) and len(seg) == 1:
+                seg = seg[0]
+            return seg
+        segmentations = []
+        for obj in anno:
+            seg = obj.get("segmentation", [])
+            seg = flatten_segmentation(seg)  # 展开嵌套结构
+            
+            # 有效性判断（至少4个点）
+            if len(seg) >= 8 and len(seg) % 2 == 0:  # 4个点需要8个坐标
+                # 坐标裁剪
+                seg_tensor = torch.as_tensor(seg, dtype=torch.float32)
+                seg_tensor = seg_tensor.view(-1, 2)
+                seg_tensor[:, 0].clamp_(min=0, max=w)  # X坐标
+                seg_tensor[:, 1].clamp_(min=0, max=h)  # Y坐标
+                segmentations.append(seg_tensor.view(-1))
+            else:
+                segmentations.append(None)  # 标记无效数据
+
+        # ==================================================================
+        # 统一数据过滤
+        # ==================================================================
+        valid_mask = [s is not None for s in segmentations]
+        boxes = boxes[valid_mask]
+        segmentations = [s for s in segmentations if s is not None]
+
+        # 处理多边形对齐
+        if segmentations:
+            max_len = max(s.numel() for s in segmentations)
+            polygons = torch.stack([
+                torch.cat([s, torch.zeros(max_len - s.numel(), dtype=torch.float32)]) 
+                for s in segmentations
+            ])
+        else:
+            polygons = torch.zeros((0, 0), dtype=torch.float32)
+
 
         category2label = kwargs.get('category2label', None)
         if category2label is not None:
@@ -135,6 +207,8 @@ class ConvertCocoPolysToMask(object):
             labels = [obj["category_id"] for obj in anno]
 
         labels = torch.tensor(labels, dtype=torch.int64)
+
+        
 
         if self.return_masks:
             segmentations = [obj["segmentation"] for obj in anno]
@@ -148,17 +222,33 @@ class ConvertCocoPolysToMask(object):
             if num_keypoints:
                 keypoints = keypoints.view(num_keypoints, -1, 3)
 
+        # 保留过滤逻辑
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         labels = labels[keep]
+        
+        # keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
+        # boxes = boxes[keep]
+        # labels = labels[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
             keypoints = keypoints[keep]
 
-        target = {}
-        target["boxes"] = boxes
-        target["labels"] = labels
+        if image_id == torch.tensor([3287]):
+            print('debug')
+        # target = {}
+        # target["boxes"] = boxes
+        # target["labels"] = labels
+                # 构造target字典
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "polys": polygons,  # 存储多边形点集
+            "image_id": image_id,
+            "orig_size": torch.as_tensor([int(w), int(h)])
+        }
+        
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id

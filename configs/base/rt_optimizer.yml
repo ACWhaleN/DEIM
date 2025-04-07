@@ -10,7 +10,7 @@ epoches: 72
 clip_max_norm: 0.1
 
 train_dataloader:
-  total_batch_size: 16
+  total_batch_size: 8
 
 optimizer:
   type: AdamW

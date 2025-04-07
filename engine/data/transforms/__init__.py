@@ -9,7 +9,7 @@ from ._transforms import (
     RandomPhotometricDistort,
     RandomZoomOut,
     RandomIoUCrop,
-    RandomHorizontalFlip,
+    # RandomHorizontalFlip,
     Resize,
     PadToSize,
     SanitizeBoundingBoxes,

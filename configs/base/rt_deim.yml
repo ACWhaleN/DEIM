@@ -8,21 +8,21 @@ train_dataloader:
         - {type: RandomPhotometricDistort, p: 0.5}
         - {type: RandomZoomOut, fill: 0}
         - {type: RandomIoUCrop, p: 0.8}
-        - {type: SanitizeBoundingBoxes, min_size: 1}
-        - {type: RandomHorizontalFlip}
+
         - {type: Resize, size: [640, 640], }
-        - {type: SanitizeBoundingBoxes, min_size: 1}
+
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+        - {type: ConvertPolygons, normalize: True}
       policy:
         epoch: [4, 29, 50]   # list 
         ops: ['Mosaic', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
       mosaic_prob: 0.5
 
   collate_fn:
-    mixup_prob: 0.5
-    mixup_epochs: [4, 29]
-    stop_epoch: 50    # epoch in [72, ~) stop `multiscales`
+    mixup_prob: 0
+    mixup_epochs: [224, 229]
+    stop_epoch: 250    # epoch in [72, ~) stop `multiscales`
 
 # Unfreezing BN
 PResNet:
@@ -44,6 +44,6 @@ no_aug_epoch: 8
 
 ## Our Loss
 DEIMCriterion:
-  weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2}
-  losses: ['mal', 'boxes', ]
+  weight_dict: {loss_mal: 1, loss_bbox: 3, loss_giou: 2 ,'loss_poly': 5.0,}
+  losses: ['mal', 'boxes', 'poly']
   gamma: 1.5

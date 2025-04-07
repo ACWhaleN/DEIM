@@ -21,17 +21,32 @@ def draw(images, labels, boxes, scores, thrh=0.4):
     for i, im in enumerate(images):
         draw = ImageDraw.Draw(im)
 
-        scr = scores[i]
-        lab = labels[i][scr > thrh]
-        box = boxes[i][scr > thrh]
-        scrs = scr[scr > thrh]
+        # 提取当前图像的分数、标签和边界框
+        scr = scores[i]  # scr.shape = [300, 4, 2]
+        lab = labels[i]  # lab.shape = [300]
+        box = boxes[i]   # box.shape = [300, 4]
 
-        for j, b in enumerate(box):
+        # 提取每个检测框的最大分数（跨锚点和类别）
+        max_scores = scr.amax(dim=(1, 2))  # shape [300]
+
+        # 生成掩码（过滤低置信度检测框）
+        mask = max_scores > thrh
+
+        # 应用掩码
+        filtered_labels = lab[mask]     # shape [num_valid]
+        filtered_boxes = box[mask]      # shape [num_valid, 4]
+        filtered_scores = max_scores[mask]  # shape [num_valid]
+
+        # 绘制检测框和标签
+        for j, b in enumerate(filtered_boxes):
             draw.rectangle(list(b), outline='red')
-            draw.text((b[0], b[1]), text=f"{lab[j].item()} {round(scrs[j].item(), 2)}", fill='blue', )
+            draw.text(
+                (b[0], b[1]),
+                text=f"{filtered_labels[j].item()} {round(filtered_scores[j].item(), 2)}",
+                fill='blue',
+            )
 
         im.save('torch_results.jpg')
-
 
 def process_image(model, device, file_path):
     im_pil = Image.open(file_path).convert('RGB')
@@ -45,7 +60,7 @@ def process_image(model, device, file_path):
     im_data = transforms(im_pil).unsqueeze(0).to(device)
 
     output = model(im_data, orig_size)
-    labels, boxes, scores = output
+    labels, boxes,polygons ,scores  = output
 
     draw([im_pil], labels, boxes, scores)
 

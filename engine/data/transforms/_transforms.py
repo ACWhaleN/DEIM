@@ -16,7 +16,7 @@ import PIL.Image
 from typing import Any, Dict, List, Optional
 
 from .._misc import convert_to_tv_tensor, _boxes_keys
-from .._misc import Image, Video, Mask, BoundingBoxes
+from .._misc import Image, Video, Mask, BoundingBoxes,Polygons
 from .._misc import SanitizeBoundingBoxes
 
 from ...core import register
@@ -25,7 +25,7 @@ torchvision.disable_beta_transforms_warning()
 
 RandomPhotometricDistort = register()(T.RandomPhotometricDistort)
 RandomZoomOut = register()(T.RandomZoomOut)
-RandomHorizontalFlip = register()(T.RandomHorizontalFlip)
+#RandomHorizontalFlip = register()(T.RandomHorizontalFlip)
 Resize = register()(T.Resize)
 # ToImageTensor = register()(T.ToImageTensor)
 # ConvertDtype = register()(T.ConvertDtype)
@@ -101,6 +101,18 @@ class ConvertBoxes(T.Transform):
         self.fmt = fmt
         self.normalize = normalize
 
+    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+        spatial_size = getattr(inpt, _boxes_keys[1])
+        if self.fmt:
+            in_fmt = inpt.format.value.lower()
+            inpt = torchvision.ops.box_convert(inpt, in_fmt=in_fmt, out_fmt=self.fmt.lower())
+            inpt = convert_to_tv_tensor(inpt, key='boxes', box_format=self.fmt.upper(), spatial_size=spatial_size)
+
+        if self.normalize:
+            inpt = inpt / torch.tensor(spatial_size[::-1]).tile(2)[None]
+
+        return inpt
+
     def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         spatial_size = getattr(inpt, _boxes_keys[1])
         if self.fmt:
@@ -116,14 +128,25 @@ class ConvertBoxes(T.Transform):
 
 @register()
 class ConvertPILImage(T.Transform):
-    _transformed_types = (
-        PIL.Image.Image,
-    )
-    def __init__(self, dtype='float32', scale=True) -> None:
+    """将 PIL.Image 转换为标准张量格式 [C, H, W]"""
+    _transformed_types = (Image,PIL.Image.Image)
+    def __init__(self, dtype=torch.float32, scale=True):
         super().__init__()
+        # 将字符串参数转换为 torch.dtype 类型
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype)  # 例如 "float32" → torch.float32
         self.dtype = dtype
         self.scale = scale
 
+    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+        inpt = F.pil_to_tensor(inpt)
+        inpt=inpt.to(dtype=self.dtype)
+        if self.scale:
+            inpt = inpt / 255.
+
+
+        return inpt
+    
     def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         inpt = F.pil_to_tensor(inpt)
         if self.dtype == 'float32':
@@ -135,3 +158,42 @@ class ConvertPILImage(T.Transform):
         inpt = Image(inpt)
 
         return inpt
+    
+@register()
+class ConvertPolygons(T.Transform):
+    """将多边形坐标转换为张量，并可选归一化到图像尺寸"""
+    _transformed_types = (
+        Polygons,
+    )
+    def __init__(self, normalize=True):
+        super().__init__()
+        self.normalize = normalize
+
+    def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+         # 获取图像尺寸
+        spatial_size = getattr(inpt, 'spatial_size')
+            # 转换多边形并归一化
+        
+        if self.normalize:
+            """
+            归一化多边形坐标到 [0,1] 范围
+            参数:
+                inpt: 输入张量，形状为 (n, 2v), 
+                    n: 多边形数量, 
+                    v: 每个多边形的顶点数（通常为4）
+                spatial_size: 图像尺寸 (w, h)
+            """
+            if len(spatial_size) != 2 or spatial_size[0] <= 0 or spatial_size[1] <= 0:
+                print(f"Invalid spatial_size: {spatial_size}, skipping transformation")
+                return inpt
+            
+            w, h = spatial_size
+            _, num_coords = inpt.shape  # 获取坐标总数 (2v)
+            
+            # 生成动态除数 [w, h, w, h, ...] 重复v次
+            divisor = torch.tensor([w, h] * (num_coords // 2), 
+                                dtype=inpt.dtype, 
+                                device=inpt.device)
+            
+            # 执行归一化 [n, 2v] / [1, 2v]
+            return inpt / divisor[None, :]
